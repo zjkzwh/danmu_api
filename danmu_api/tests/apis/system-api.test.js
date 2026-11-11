@@ -1,4 +1,4 @@
-// 系统接口：缓存清理
+// 系统接口：缓存清理与日志文本输出
 // 由原单文件测试 worker.test.js 机械拆分而来，用例名与断言未做改动。
 
 import dotenv from 'dotenv';
@@ -6,17 +6,42 @@ dotenv.config();
 
 import test from 'node:test';
 import assert from 'node:assert';
-import { handleClearCache } from '../../apis/system-api.js';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { handleClearCache, handleLogs } from '../../apis/system-api.js';
 import { Globals } from '../../configs/globals.js';
 import { addFavorite, resolveFavoriteForKeyword } from '../../utils/favorite-util.js';
 import { parseResponse } from '../helpers/context.js';
 import { createFavoriteAnime, favoriteSearchResult, resetFavoriteState } from '../helpers/favorites.js';
+
+// 本文件多条用例会触发全量清理，其中「清理 Bangumi-Data」会 unlink 磁盘缓存
+// .cache/bangumi-data-cache.json —— 该文件只能联网重新下载（约 4MB），不能让它被测试删掉。
+// 因此在本文件范围内备份该文件，跑完恢复（原本不存在则保持不存在）。
+const BANGUMI_CACHE_PATH = path.join(process.cwd(), '.cache', 'bangumi-data-cache.json');
+const bangumiCacheBackup = { hadCache: false, data: null };
+
+test.before(async () => {
+  bangumiCacheBackup.hadCache = await fs.access(BANGUMI_CACHE_PATH).then(() => true, () => false);
+  if (bangumiCacheBackup.hadCache) bangumiCacheBackup.data = await fs.readFile(BANGUMI_CACHE_PATH);
+});
+
+test.after(async () => {
+  if (bangumiCacheBackup.hadCache) {
+    await fs.mkdir(path.dirname(BANGUMI_CACHE_PATH), { recursive: true });
+    await fs.writeFile(BANGUMI_CACHE_PATH, bangumiCacheBackup.data);
+  } else {
+    await fs.rm(BANGUMI_CACHE_PATH, { force: true });
+  }
+});
 
 test('clearing runtime caches preserves favorites and auto match mapping configuration', async () => {
     resetFavoriteState({
       AUTO_MATCH_MAPPING_TABLE: '火影忍者 S01E57->火影忍者 疾风传(2007)【日番】 S01E59',
       LOG_LEVEL: 'error'
     });
+    // 全量清理会走到 bangumiData 清理分支，该开关打开时清理后还会触发一次真实后台下载；
+    // 这里关闭它，磁盘缓存本身的删除副作用由本文件顶部的 before/after 备份恢复兜住。
+    Globals.useBangumiData = false;
     const anime = createFavoriteAnime('火影忍者');
     addFavorite('火影忍者', [favoriteSearchResult(anime)], [anime]);
     Globals.lastSelectMap.set('火影忍者', {
@@ -152,3 +177,32 @@ test('handleClearCache clears only the selected cache items', async t => {
       assert.equal(Globals.commentCache.size, 1);
     });
   });
+
+test('handleLogs renders each log entry as "[timestamp] level: message"', async t => {
+  const saved = Globals.logBuffer;
+  t.after(() => { Globals.logBuffer = saved; });
+  Globals.logBuffer = [
+    { timestamp: '2026-10-31T08:00:00.000+08:00', level: 'info', message: '[system] [tmdb] 中文标题' },
+    { timestamp: '2026-10-31T08:00:01.000+08:00', level: 'error', message: '[tencent] 请求失败' },
+  ];
+  const response = handleLogs();
+  assert.equal(await response.text(), [
+    '[2026-10-31T08:00:00.000+08:00] info: [system] [tmdb] 中文标题',
+    '[2026-10-31T08:00:01.000+08:00] error: [tencent] 请求失败',
+  ].join('\n'));
+});
+
+test('handleLogs keeps newlines and indentation of multi-line messages', async t => {
+  const saved = Globals.logBuffer;
+  t.after(() => { Globals.logBuffer = saved; });
+  Globals.logBuffer = [{
+    timestamp: '2026-10-31T08:00:00.000+08:00',
+    level: 'info',
+    message: '[merge][Phase 2: Standard] [tencent] 映射详情:\n   [已路由映射] 第1集 <-> 第1集',
+  }];
+  const response = handleLogs();
+  assert.deepEqual((await response.text()).split('\n'), [
+    '[2026-10-31T08:00:00.000+08:00] info: [merge][Phase 2: Standard] [tencent] 映射详情:',
+    '   [已路由映射] 第1集 <-> 第1集',
+  ]);
+});

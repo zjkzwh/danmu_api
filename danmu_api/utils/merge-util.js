@@ -174,6 +174,8 @@ const RegexStore = {
         INFO_STRONG:      /(?:season|s|第)\s*[0-9一二三四五六七八九十]+\s*(?:季|期|部(?!分))?/gi,
         PART_INFO_STRONG: /(?:part|p|第)\s*\d+\s*(?:部分)?/gi,
         PART_ANY:         /(?:part|p)\s*\d+/gi,
+        PART_MARKER_CN:   /第\s*([0-9]+|[一二三四五六七八九十]+)(?:\s*&\s*第\s*([0-9]+|[一二三四五六七八九十]+))?\s*(?:赛段|季|期|部|部分)/g,
+        PART_MARKER_LATIN:/(?:season|stage|part|s)\s*\.?\s*(\d+)/g,
         CN_STRUCTURE:     /(?:^|\s|×\d+\s?)(承|转|结)(?=$|[\s\(\（\[【])/i,
         SUFFIX_AMBIGUOUS: /(?:[\s\u4e00-\u9fa5]|^)(S|T|R|II|III|IV)(?=$|[\s\(\（\[【])/i,
         SUFFIX_SEQUEL:    /(?:续篇|续集|The Sequel)/i
@@ -745,6 +747,25 @@ function getSeasonNumber(title, typeDesc = '', aliases = []) {
         }
     }
     return maxSeason;
+}
+
+/**
+ * 提取标题中的分部标记：赛段、季、期、部与 Season/Stage/Part 的序号
+ * 用于映射表规则匹配时区分仅在分部写法上不同的条目
+ * @param {string} title - 标题
+ * @returns {Set<string>} 分部序号集合（阿拉伯数字形式）
+ */
+function getPartMarkers(title) {
+    const markers = new Set();
+    const text = simplized(String(title || '')).toLowerCase();
+    for (const m of text.matchAll(RegexStore.Season.PART_MARKER_CN)) {
+        markers.add(String(parseInt(convertChineseNumber(m[1]), 10)));
+        if (m[2]) markers.add(String(parseInt(convertChineseNumber(m[2]), 10)));
+    }
+    for (const m of text.matchAll(RegexStore.Season.PART_MARKER_LATIN)) {
+        markers.add(String(parseInt(m[1], 10)));
+    }
+    return markers;
 }
 
 /**
@@ -1420,9 +1441,9 @@ function findBestAlignmentOffset(
     });
     const seasonShift = (minNormalA !== null && minNormalB !== null) ? (minNormalA - minNormalB) : null;
 
-    // 集号基准：两侧正片的最小集号相同，说明双方采用同一套编号。基准不同（一方本季从 1 起、另一方承接
-    // 上一季顺延编号）时，同一号码落在双方各自不同的集上，此时号码相等不构成集号对齐的证据。
-    const sharesEpisodeBase = (seasonShift === 0);
+    // 集号基准：两侧正片的最小集号相差不超过 1 时视为同一套编号，较小一侧仅缺首集且该集由同一来源的相邻分部条目提供
+    // 基准不同（一方本季从 1 起、另一方承接上一季顺延编号）时，同一号码落在双方各自不同的集上，号码相等不构成集号对齐的证据
+    const sharesEpisodeBase = (seasonShift !== null && Math.abs(seasonShift) <= 1);
 
     // 动态计算搜索范围，以估算的季度偏移为中心向外延伸
     const baseRange  = 15;
@@ -2004,6 +2025,16 @@ function getMatchingCustomRule(pAnime, sAnime) {
         };
     };
 
+    const pPartMarkers = getPartMarkers(pAnime.animeTitle);
+    const sPartMarkers = getPartMarkers(sAnime.animeTitle);
+    const countSharedMarkers = (targetMarkers, ruleTitle) => {
+        let count = 0;
+        for (const marker of getPartMarkers(ruleTitle)) if (targetMarkers.has(marker)) count++;
+        return count;
+    };
+
+    let firstMatch = null, bestMatch = null, bestScore = 0;
+
     for (const rule of rules) {
         // 提取基础源(Base Source)，并使用已导入的 DISPLAY_CONNECTOR 常量
         const getBaseSource = (src) => String(src).split(DISPLAY_CONNECTOR)[0];
@@ -2030,9 +2061,13 @@ function getMatchingCustomRule(pAnime, sAnime) {
         if (rule.primary.season !== null && (pSeason || 1) !== rule.primary.season) continue;
         if (rule.secondary.season !== null && (sSeason || 1) !== rule.secondary.season) continue;
 
-        return rule;
+        // 分部标记择优：多条规则的标题在剥离分部噪声后相同时，规则中书写且与条目一致的分部数多者优先，均无一致分部时按书写顺序取首个
+        if (firstMatch === null) firstMatch = rule;
+        const score = countSharedMarkers(pPartMarkers, rule.primary.title) +
+                      countSharedMarkers(sPartMarkers, rule.secondary.title);
+        if (score > bestScore) { bestMatch = rule; bestScore = score; }
     }
-    return null;
+    return bestScore > 0 ? bestMatch : firstMatch;
 }
 
 /**
@@ -2176,16 +2211,25 @@ export function findSecondaryMatches(primaryAnime, secondaryList, collectionAnim
         const isSeasonExactMatch = hasSameSeasonMarker(primaryTitleForSim, secTitleForSim, primaryAnime.typeDescription, secAnime.typeDescription, primaryAnime.aliases, secAnime.aliases);
         const contentProbe       = probeContentMatch(primaryAnime, secAnime);
 
+        // ── 主副别名交叉比对 ─────────────────────────────────────────────
+        const primaryCandidates = Array.from(new Set([primaryTitleForSim, ...(primaryAnime.aliases || [])].map(titleForSimilarity).filter(Boolean)));
+        const secCandidates     = Array.from(new Set([secTitleForSim,     ...(secAnime.aliases     || [])].map(titleForSimilarity).filter(Boolean)));
+
         // ── 剧场版标题阻断 ───────────────────────────────────────────────
         // 防止 "Title Movie" 与 "Title (TV)" 因高相似度而误合并
         const hasMovieA = rawPrimaryTitle.search(RegexStore.Clean.MOVIE_KEYWORDS) !== -1;
         const hasMovieB = rawSecTitle.search(RegexStore.Clean.MOVIE_KEYWORDS) !== -1;
         if (hasMovieA !== hasMovieB) {
             const markersB  = extractSeasonMarkers(rawSecTitle, secAnime.typeDescription, secAnime.aliases);
+            // 在「标题 + 别名」候选集上比对，与相似度评分保持同一候选集，避免别名命中绕过阻断
             const stripMovie = (t) => cleanTitleForSimilarity(t.replace(RegexStore.Clean.MOVIE_KEYWORDS, ''));
-            const cleanA    = stripMovie(rawPrimaryTitle);
-            const cleanB    = stripMovie(rawSecTitle);
-            if (calculateSimilarity(cleanA, cleanB) > 0.9) {
+            let bestMovieSim = 0;
+            for (const pCand of primaryCandidates) {
+                for (const sCand of secCandidates) {
+                    bestMovieSim = Math.max(bestMovieSim, calculateSimilarity(stripMovie(pCand), stripMovie(sCand)));
+                }
+            }
+            if (bestMovieSim > 0.9) {
                 if (!markersP.has('SEQUEL') && !markersB.has('SEQUEL')) {
                     logReason(rawSecTitle, `剧场版标题阻断: [${hasMovieA ? 'Movie' : 'TV'}] vs [${hasMovieB ? 'Movie' : 'TV'}] (无续篇标识)`);
                     continue;
@@ -2213,10 +2257,6 @@ export function findSecondaryMatches(primaryAnime, secondaryList, collectionAnim
                 continue;
             }
         }
-
-        // ── 主副别名交叉比对 ─────────────────────────────────────────────
-        const primaryCandidates = Array.from(new Set([primaryTitleForSim, ...(primaryAnime.aliases || [])].map(titleForSimilarity).filter(Boolean)));
-        const secCandidates     = Array.from(new Set([secTitleForSim,     ...(secAnime.aliases     || [])].map(titleForSimilarity).filter(Boolean)));
 
         // 主源候选池 × 副源候选池 全量交叉，取最高相似度
         let bestScoreFull = 0, bestScoreBase = 0;
@@ -3216,6 +3256,8 @@ async function processMergeTask(params) {
             `from ${currentPrimarySource}${DISPLAY_CONNECTOR}${joinedSources}`
         );
         derivedAnime.source = currentPrimarySource;
+        // 合并后总集数以最终 links 为准，与详情页展示的集数保持一致
+        derivedAnime.episodeCount = derivedAnime.links.length;
         return derivedAnime;
     }
     return null;
